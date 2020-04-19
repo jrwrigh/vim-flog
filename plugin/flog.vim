@@ -383,6 +383,8 @@ let g:flog_git_subcommands = {
 command! -range=0 -complete=customlist,flog#complete -nargs=* Flog call flog#open((<count> ? ['-limit=<line1>,<line2>:' . expand('%:p')] : []) + [<f-args>])
 command! -range=0 -complete=customlist,flog#complete -nargs=* Flogsplit call flog#open((<count> ? ['-limit=<line1>,<line2>:' . expand('%:p')] : []) + ['-open-cmd=<mods> split', <f-args>])
 
+command! -range=0 -complete=customlist,flog#complete -nargs=* Flogasync call flog#open_async((<count> ? ['-limit=<line1>,<line2>:' . expand('%:p')] : []) + [<f-args>])
+
 " }}}
 
 " vim: set et sw=2 ts=2 fdm=marker:

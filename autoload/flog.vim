@@ -1,3 +1,5 @@
+" TODO: remove unused functions, global variables/state for those functions
+
 " Utilities {{{
 
 function! flog#instance() abort
@@ -180,10 +182,300 @@ function! flog#get_fugitive_git_command() abort
   return l:git_command
 endfunction
 
+function! flog#get_fugitive_git_command_async() abort
+  let l:git_dir = flog#get_state().fugitive_repo.dir()
+  return ['git', '--git-dir=' . l:git_dir]
+endfunction
+
 function! flog#trigger_fugitive_git_detection() abort
   let b:git_dir = flog#get_state().fugitive_repo.dir()
   let l:workdir = flog#get_fugitive_workdir()
   call FugitiveDetect(l:workdir)
+endfunction
+
+" }}}
+
+" Job interface {{{
+
+" TODO: write job functions for neovim/vim 7
+
+" Job callback handlers {{{
+
+function! flog#job_out_cb_vim(cb, channel, line) abort
+  call a:cb(ch_getjob(a:channel), a:line)
+endfunction
+
+function! flog#job_exit_cb_vim(cb, channel, status) abort
+  call a:cb(ch_getjob(a:channel), a:status)
+endfunction
+
+function flog#ch_getjob(ch) abort
+  return ch_getjob(a:ch)
+endfunction
+
+" }}}
+
+function! flog#job_start(command, ...) abort
+  let l:options = get(a:, 1, {})
+
+  if has_key(l:options, 'out_cb')
+    let l:options.out_cb = function('flog#job_out_cb_vim', [l:options.out_cb])
+  endif
+
+  if has_key(l:options, 'err_cb')
+    let l:options.err_cb = function('flog#job_out_cb_vim', [l:options.err_cb])
+  endif
+
+  if has_key(l:options, 'exit_cb')
+    let l:options.exit_cb = function('flog#job_exit_cb_vim', [l:options.exit_cb])
+  endif
+
+  return job_start(a:command, l:options)
+endfunction
+
+function! flog#job_status(job) abort
+  return job_status(a:job)
+endfunction
+
+function! flog#job_stop(job) abort
+  let l:how = get(a:, 1, 'term')
+  return job_stop(a:job, l:how)
+endfunction
+
+function! flog#is_job(job) abort
+  return type(a:job) == v:t_job
+endfunction
+
+" }}}
+
+" Topological sorting {{{
+
+" Group commits by arc {{{
+
+function! flog#is_arc_vertex(state, u) abort
+  if len(a:state.parent_hashes[a:u]) != 1
+    return 0
+  endif
+  return len(a:state.child_hashes[a:state.parent_hashes[a:u][0]]) == 1
+endfunction
+
+function! flog#add_new_arc(state, u, v) abort
+  let l:arcid = a:state.next_arc_id
+  let a:state.arcs[l:arcid] = a:u
+  let a:state.commit_arc_ids[a:u] = l:arcid
+  if a:u != a:v
+    let a:state.commit_arc_ids[a:v] = l:arcid
+  endif
+  let a:state.arc_tails[l:arcid] = a:v
+  let a:state.arc_labels[l:arcid] = a:state.current_arc_label
+  let a:state.next_arc_id += 1
+  return l:arcid
+endfunction
+
+function! flog#add_new_orphan_arc(state, u) abort
+  return flog#add_new_arc(a:state, a:u, a:u)
+endfunction
+
+function! flog#update_arc_root(state, u, v) abort
+  let l:arcid = a:state.commit_arc_ids[a:v]
+  let a:state.commit_arc_ids[a:u] = l:arcid
+  let a:state.arcs[l:arcid] = a:u
+  return l:arcid
+endfunction
+
+function! flog#update_arc_tail(state, u, v) abort
+  let l:arcid = a:state.commit_arc_ids[a:u]
+  let a:state.commit_arc_ids[a:v] = l:arcid
+  let a:state.arc_tails[l:arcid] = a:v
+  return l:arcid
+endfunction
+
+function! flog#merge_arcs(state, u, v) abort
+  let l:old_arcid = a:state.commit_arc_ids[a:u]
+  let l:root = a:state.arcs[l:old_arcid]
+  let l:arcid = a:state.commit_arc_ids[a:v]
+
+  call flog#update_arc_root(a:state, l:root, a:v)
+
+  call remove(a:state.arcs, l:old_arcid)
+  call remove(a:state.arc_tails, l:old_arcid)
+  call remove(a:state.arc_labels, l:old_arcid)
+
+  let l:v = a:v
+  while l:v != l:root
+    let a:state.commit_arc_ids[l:v] = l:arcid
+    let l:v = a:state.child_hashes[l:v][0]
+  endwhile
+
+  return l:arcid
+endfunction
+
+function! flog#split_arc(state, u) abort
+  " split child arc
+  call flog#update_arc_tail(a:state, a:u, a:u)
+
+  " split parent arcs
+  for l:v in a:state.parent_hashes[a:u]
+    let l:v_arcid = a:state.commit_arc_ids[l:v]
+    if l:v_arcid < 0
+      " no arc, v is a new vertex
+      call flog#add_new_orphan_arc(a:state, l:v)
+    elseif a:state.arcs[l:v_arcid] == l:v
+      " v is its own arc root, it is already split
+      continue
+    else
+      " split the arc
+
+      " store info about the old arc before updating
+      let l:tail = a:state.arc_tails[a:state.commit_arc_ids[l:v]]
+
+      " update the tail of the old arc.
+      " for this to be a new split, the parent must have two child_hashes:
+      " the child the parent previously had, and the new parent.
+      " otherwise, it would have already been split.
+      let [l:child1, l:child2] = a:state.child_hashes[l:v]
+      let l:split_tail = l:child1 == a:u ? l:child2 : l:child1
+      call flog#update_arc_tail(a:state, l:v, l:split_tail)
+
+      " add the new arc
+      let l:split_arcid = flog#add_new_orphan_arc(a:state, l:v)
+
+      if l:v != l:tail
+        call flog#update_arc_tail(a:state, l:v, l:tail)
+        " update the parent arcs
+        while l:v != l:tail
+          let l:v = a:state.parent_hashes[l:v][0]
+          let a:state.commit_arc_ids[l:v] = l:split_arcid
+        endwhile
+      endif
+    endif
+  endfor
+endfunction
+
+function! flog#update_arcs(state, u) abort
+  " test if there is a single parent with a single child
+  if flog#is_arc_vertex(a:state, a:u)
+    " the single parent
+    let l:v = a:state.parent_hashes[a:u][0]
+
+    if a:state.commit_arc_ids[a:u] < 0
+      if a:state.commit_arc_ids[l:v] < 0
+        " is an arc, but no child or parent arc exists.
+        " add a completely new arc with both vertices.
+        return flog#add_new_arc(a:state, a:u, l:v)
+      endif
+
+      " is an arc, and the parent already has an arc but the child does not.
+      " update the parent arc's root to the child.
+      return flog#update_arc_root(a:state, a:u, l:v)
+    endif
+
+    if a:state.commit_arc_ids[l:v] < 0
+      " is an arc, the parent does not have an arc but the child does.
+      " update the child's arc tail to the parent.
+      return flog#update_arc_tail(a:state, a:u, l:v)
+    endif
+
+    " is an arc, and both the parent/child have arcs.
+    " merge the two arcs together.
+    return flog#merge_arcs(a:state, a:u, l:v)
+  endif
+
+  if a:state.commit_arc_ids[a:u] < 0
+    " is not an arc, and the parent does not yet have an arc.
+    " add a new arc with a single vertex.
+    call flog#add_new_orphan_arc(a:state, a:u)
+  endif
+
+  " a new child was added and this is not an arc so separate the parent_hashes
+  call flog#split_arc(a:state, a:u)
+endfunction
+
+" }}}
+
+" Sort arcs {{{
+
+function! flog#update_label(state, u) abort
+  let l:arc_labels = a:state.arc_labels
+
+  let l:arcid = a:state.commit_arc_ids[a:u]
+  let l:arctail = a:state.arc_tails[l:arcid]
+  let l:arclabel = l:arc_labels[l:arcid]
+
+  for l:v in a:state.parent_hashes[l:arctail]
+    let l:v_arcid = a:state.commit_arc_ids[l:v]
+    if l:arclabel >= l:arc_labels[l:v_arcid] 
+      let l:arc_labels[l:v_arcid] = l:arclabel + 1
+      call flog#update_label(a:state, l:v)
+    endif
+  endfor
+endfunction
+
+function! flog#topo_sort_commits(state) abort
+  if empty(a:state.arc_labels)
+  endif
+
+  let a:state.sorted_commits = []
+  let l:labels = {}
+  let l:maxlabel = 0
+
+  for [l:arcid, l:label] in items(a:state.arc_labels)
+    if !has_key(l:labels, l:label)
+      let l:labels[l:label] = [l:arcid]
+    else
+      call add(l:labels[l:label], l:arcid)
+    endif
+    if l:label > l:maxlabel
+      let l:maxlabel = l:label
+    endif
+  endfor
+
+  let l:i = 0
+  while l:i <= l:maxlabel
+    for l:arcid in get(l:labels, l:i, [])
+      let l:arc = a:state.arcs[l:arcid]
+      let l:arctail = a:state.arc_tails[l:arcid]
+      call add(a:state.sorted_commits, l:arc)
+      while l:arc != l:arctail
+        let l:arc = a:state.parent_hashes[l:arc][0]
+        call add(a:state.sorted_commits, l:arc)
+      endwhile
+    endfor
+    let l:i += 1
+  endwhile
+
+  let a:state.current_arc_label = l:maxlabel + 1
+endfunction
+
+" }}}
+
+function! flog#init_vertex(state, u) abort
+  if !has_key(a:state.child_hashes, a:u)
+    let a:state.child_hashes[a:u] = []
+    let a:state.parent_hashes[a:u] = []
+    let a:state.commit_arc_ids[a:u] = -1
+  endif
+endfunction
+
+function! flog#connect_vertices(state, u, vs) abort
+  call flog#init_vertex(a:state, a:u)
+
+  let a:state.parent_hashes[a:u] += a:vs
+
+  let l:i = len(a:vs)
+  while l:i > 0
+    let l:i -= 1
+    let l:v = a:vs[l:i]
+    call flog#init_vertex(a:state, l:v)
+    call add(a:state.child_hashes[l:v], a:u)
+  endwhile
+endfunction
+
+function! flog#add_commit_to_graph(state, commit) abort
+  call flog#connect_vertices(a:state, a:commit.hash, a:commit.parent_hashes)
+  call flog#update_arcs(a:state, a:commit.hash)
+  call flog#update_label(a:state, a:commit.hash)
+  call flog#topo_sort_commits(a:state)
 endfunction
 
 " }}}
@@ -621,8 +913,53 @@ function! flog#get_initial_state(parsed_args, original_file) abort
         \ })
 endfunction
 
+function! flog#reset_log_command_state(state) abort
+  return extend(a:state, {
+        \ 'log_command_errors': [],
+        \ 'current_raw_commit': [],
+        \ 'commit_by_hash': {},
+        \ 'sorted_commits': [],
+        \ 'arcs': {},
+        \ 'arc_tails': {},
+        \ 'arc_labels': {},
+        \ 'commit_arc_ids': {},
+        \ 'next_arc_id': 0,
+        \ 'current_arc_label': 0,
+        \ 'child_hashes': {},
+        \ 'parent_hashes': {},
+        \ 'last_graph_branches': [],
+        \ })
+endfunction
+
+function! flog#get_initial_state_async(parsed_args, original_file) abort
+  return flog#reset_log_command_state(extend(copy(a:parsed_args), {
+        \ 'instance': flog#instance(),
+        \ 'fugitive_repo': flog#get_initial_fugitive_repo(),
+        \ 'original_file': a:original_file,
+        \ 'graph_window_id': v:null,
+        \ 'graph_buffer_id': v:null,
+        \ 'tmp_window_ids': [],
+        \ 'previous_log_command': v:null,
+        \ 'previous_log_job': v:null,
+        \ 'line_commits': [],
+        \ 'all_refs': [],
+        \ 'commit_refs': [],
+        \ 'line_commit_refs': [],
+        \ 'ref_line_lookup': {},
+        \ }))
+endfunction
+
 function! flog#set_buffer_state(state) abort
   let b:flog_state = a:state
+endfunction
+
+function! flog#append_current_commit_state(state, line) abort
+  call add(a:state.current_raw_commit, a:line)
+endfunction
+
+function! flog#finalize_current_commit_state(state, commit) abort
+  let a:state.commit_by_hash[a:commit.hash] = a:commit
+  let a:state.current_raw_commit = []
 endfunction
 
 function! flog#get_state() abort
@@ -661,6 +998,24 @@ function! flog#create_log_format() abort
   return shellescape(l:format)
 endfunction
 
+function! flog#create_log_format_async() abort
+  let l:state = flog#get_state()
+
+  " our format needed for parsing
+  " TODO: move to global variable
+  let l:format = "format:%m%H\n%h\n%T\n%P\n%D\n"
+
+  " user format
+  let l:format .= l:state.format
+
+  " end format
+  let l:format .= "\n"
+  let l:format .= g:flog_format_end
+
+  " perform string formatting to avoid shell interpolation
+  return l:format
+endfunction
+
 function! flog#parse_log_commit(c) abort
   let l:i = stridx(a:c, g:flog_format_start)
   if l:i < 0
@@ -691,6 +1046,18 @@ function! flog#parse_log_commit(c) abort
         \ "\n")
 
   return l:c
+endfunction
+
+function! flog#parse_log_commit_async(raw_commit) abort
+  return {
+        \ 'mark': a:raw_commit[0][0],
+        \ 'hash': a:raw_commit[0][1:],
+        \ 'abbrev_hash': a:raw_commit[1],
+        \ 'tree_hash': a:raw_commit[2],
+        \ 'parent_hashes': split(a:raw_commit[3]),
+        \ 'refs': split(a:raw_commit[4], ', '),
+        \ 'display': a:raw_commit[5:],
+        \ }
 endfunction
 
 function! flog#parse_log_output(output) abort
@@ -738,6 +1105,14 @@ function! flog#build_log_paths() abort
   endif
   let l:paths = map(l:state.path, 'fnamemodify(v:val, ":.")')
   return ' -- ' . join(l:paths, ' ')
+endfunction
+
+function! flog#build_log_paths_async() abort
+  let l:state = flog#get_state()
+  if len(l:state.path) == 0
+    return []
+  endif
+  return ['--'] + map(l:state.path, 'fnamemodify(v:val, ":.")')
 endfunction
 
 function! flog#build_log_command() abort
@@ -800,12 +1175,149 @@ function! flog#build_log_command() abort
   return l:command
 endfunction
 
+function! flog#build_log_command_async() abort
+  let l:state = flog#get_state()
+
+  let l:command = flog#get_fugitive_git_command_async()
+  call add(l:command, 'log')
+  " TODO: remove -no-graph option
+  " if !l:state.no_graph
+  "   let l:command .= ' --graph'
+  " endif
+  call add(l:command, '--boundary')
+  call add(l:command, '--no-color')
+  call add(l:command, '--pretty=' . flog#create_log_format_async())
+  call add(l:command, '--date=' . l:state.date)
+  if l:state.all && !l:state.limit
+    call add(l:command, '--all')
+  endif
+  if l:state.bisect && !l:state.limit
+    call add(l:command, '--bisect')
+  endif
+  if l:state.no_merges
+    call add(l:command, '--no-merges')
+  endif
+  if l:state.reflog && !l:state.limit
+    call add(l:command, '--reflog')
+  endif
+  if l:state.skip != v:null
+    call add(l:command, '--skip=' . l:state.skip)
+  endif
+  if l:state.max_count != v:null
+    call add(l:command, '--max-count=' . l:state.max_count)
+  endif
+  if l:state.search != v:null
+    let l:search = l:state.search
+    call add(l:command, '--grep=' . l:search)
+  endif
+  if l:state.patch_search != v:null
+    let l:patch_search = l:state.patch_search
+    call add(l:command, '-G' . l:patch_search)
+  endif
+  if l:state.limit != v:null
+    let l:limit = l:state.limit
+    call add(l:command, '-L' . l:limit)
+  endif
+  " TODO: check raw args for conflicts
+  if l:state.raw_args != v:null
+    call add(l:command, l:state.raw_args)
+  endif
+  if len(l:state.rev) >= 1
+    if l:state.limit
+      let l:rev = l:state.rev[0]
+      call add(l:command, l:state.rev[0])
+    else
+      let l:command += l:state.rev
+    endif
+  endif
+  " TODO: redo highlighting if needed
+  " TODO: remove ansi escape option
+  " if get(g:, 'flog_use_ansi_esc')
+  "   call add(l:command, '--color')
+  " endif
+  let l:command += flog#build_log_paths_async()
+
+  return l:command
+endfunction
+
 function! flog#get_log_display(commits) abort
   let l:o = []
   for l:c in a:commits
     let l:o += l:c.display
   endfor
   return l:o
+endfunction
+
+" }}}
+
+" Log job management {{{
+
+function! flog#log_job_out_cb(state, job, line) abort
+  if a:job != a:state.previous_log_job
+    " will warn on exit
+    return
+  endif
+
+  " TODO: handle quitting flog
+  " TODO: handle any errors
+  " TODO: build more robust commit data
+  " TODO: quit early if graph buffer is dead
+
+  if a:line !=# g:flog_format_end
+    call flog#append_current_commit_state(a:state, a:line)
+  else
+    call flog#add_current_commit_to_graph(a:state)
+  endif
+endfunction
+
+function! flog#log_job_err_cb(state, job, line) abort
+  if a:job != a:state.previous_log_job
+    " will warn on exit
+    return
+  endif
+
+  " TODO: handle any errors
+endfunction
+
+function! flog#log_job_exit_cb(state, job, status) abort
+  let l:should_ret = 0
+
+  if a:job != a:state.previous_log_job
+    " TODO: will this always be appropriate? what if we kill the job?
+    " TODO: better warning
+    echoerr 'warning: detected running two commands at once on exit'
+    echoerr 'warning: detected running two commands at once on exit'
+    let l:should_ret = 1
+  endif
+
+  if a:status
+    " TODO: better warning
+    echoerr 'waring: did not exit successfully'
+    echoerr 'waring: did not exit successfully'
+  endif
+
+  if l:should_ret
+    return
+  endif
+
+  " TODO: handle log exit
+endfunction
+
+" TODO: stop job on exit
+function! flog#log_job_start(command) abort
+  let l:state = flog#get_state()
+
+  if flog#is_job(l:state.previous_log_job)
+    call flog#job_stop(l:state.previous_log_job)
+  endif
+
+  let l:job_options = {}
+  let l:job_options.out_cb = function('flog#log_job_out_cb', [l:state])
+  let l:job_options.err_cb = function('flog#log_job_err_cb', [l:state])
+  " TODO: error callback with warnings
+  let l:job_options.exit_cb = function('flog#log_job_exit_cb', [l:state])
+
+  let l:state.previous_log_job = flog#job_start(a:command, l:job_options)
 endfunction
 
 " }}}
@@ -974,6 +1486,240 @@ endfunction
 
 " Graph buffer {{{
 
+" Graph buffer drawing {{{
+
+function! flog#draw_clear() abort
+  call flog#get_state()
+  silent setlocal modifiable
+  silent setlocal noreadonly
+  1,$ d
+  silent setlocal nomodifiable
+  silent setlocal readonly
+endfunction
+
+function! flog#start_drawing(state) abort
+  call setbufvar(a:state.graph_buffer_id, '&modifiable', 1)
+  call setbufvar(a:state.graph_buffer_id, '&readonly', 0)
+endfunction
+
+function! flog#finish_drawing(state) abort
+  call setbufvar(a:state.graph_buffer_id, '&modifiable', 0)
+  call setbufvar(a:state.graph_buffer_id, '&readonly', 1)
+endfunction
+
+function! flog#draw_at_end_of_graph(state, lines) abort
+  let l:buf = a:state.graph_buffer_id
+  let l:lastline = line('$', a:state.graph_window_id)
+  if l:lastline <= 1 && len(getbufline(l:buf, 1)[0]) == 0
+    call setbufline(l:buf, 1, a:lines)
+  else
+    call appendbufline(l:buf, l:lastline, a:lines)
+  endif
+endfunction
+
+function! flog#draw_boundary_commit(state, commit) abort
+  return
+endfunction
+
+function! flog#draw_commit(state, commit) abort
+  if a:commit.mark ==# '-'
+    return flog#draw_boundary_commit(a:state, a:commit)
+  else
+    " TODO: handle lots of space between commits
+    " TODO: break up function
+
+    " compute branch structure
+
+    let l:graph_branches = a:state.last_graph_branches
+
+    let l:commit_branch_index = index(l:graph_branches, a:commit.hash)
+    " commit branch is new, update graph branches to current structure
+    if l:commit_branch_index < 0
+      let l:commit_branch_index = len(l:graph_branches)
+      call add(l:graph_branches, a:commit.hash)
+    endif
+
+    let l:merge_branch = map(copy(l:graph_branches), '0')
+    let l:first_merge = -1
+    let l:last_merge = -1
+    let l:resolve_branch_index = -1
+    let l:new_branches = []
+    let l:new_commit_branch = ''
+
+    for l:parent in a:commit.parent_hashes
+      let l:i = index(l:graph_branches, l:parent)
+      if l:i >= 0
+        " add existing branch to merges
+        let l:merge_branch[l:i] = 1
+        if l:first_merge < 0 || l:i < l:first_merge
+          let l:first_merge = l:i
+        endif
+        if l:last_merge < 0 || l:i > l:last_merge
+          let l:last_merge = l:i
+        endif
+        " handle the new commit branch index being an existing branch
+        if empty(l:new_commit_branch) && l:i > l:commit_branch_index
+          let l:new_commit_branch = l:parent
+          let l:resolve_branch_index = l:i
+        endif
+      else
+        " add new branch to merges
+        if empty(l:new_commit_branch)
+          let l:new_commit_branch = l:parent
+        else
+          let l:new_index = len(l:graph_branches) + len(l:new_branches)
+          if l:first_merge < 0
+            let l:first_merge = l:new_index
+          endif
+          let l:last_merge = l:new_index
+          call add(l:new_branches, l:parent)
+        endif
+      endif
+    endfor
+
+    " handle first/last merge being beyond current branch
+    if l:first_merge >= 0 && l:first_merge > l:commit_branch_index
+      let l:first_merge = l:commit_branch_index
+    endif
+    if l:last_merge >= 0 && l:last_merge < l:commit_branch_index
+      let l:last_merge = l:commit_branch_index
+    endif
+
+    " build output lines
+
+    " build branch characters to prepend commits
+    let l:graph_filler_list = []
+    for l:branch in l:graph_branches
+      if empty(l:branch)
+        let l:graph_filler_list += [' ', ' ']
+      else
+        let l:graph_filler_list += ['|', ' ']
+      endif
+    endfor
+    let l:graph_filler = join(l:graph_filler_list, '')
+
+    " draw special character at commit branch
+    let l:first_line = l:graph_filler_list + [get(a:commit.display, 0, '')]
+    let l:first_line[l:commit_branch_index * 2] = '*'
+
+    let l:display = [join(l:first_line, '')]
+    let l:display += map(a:commit.display[1:], 'l:graph_filler . v:val')
+
+    " add extra line for long commits
+    if len(l:display) > 1 && !empty(get(a:commit.display, -1, ''))
+      call add(l:display, l:graph_filler)
+    endif
+
+    " build merge output
+    if l:first_merge >= 0
+      let l:merge_line = []
+
+      " build merge output for existing branches
+      let l:i = 0
+      while l:i < len(l:graph_branches)
+        let l:branch = l:graph_branches[l:i]
+
+        if l:branch ==# ''
+          call add(l:merge_line, ' ')
+        else
+          call add(l:merge_line, '|')
+        endif
+        call add(l:merge_line, ' ')
+
+        let l:i += 1
+      endwhile
+
+      " build horizontal merge line
+      let l:i = l:first_merge
+      while l:i < l:last_merge && l:i < len(l:graph_branches)
+        let l:merge_col = l:i * 2
+        let l:is_merge_branch = l:merge_branch[l:i]
+
+        if !l:is_merge_branch
+          let l:merge_line[l:merge_col] = '-'
+        endif
+        let l:merge_line[l:merge_col + 1] = '-'
+
+        let l:i += 1
+      endwhile
+
+      " build current commit
+      let l:commit_col = l:commit_branch_index * 2
+      if empty(l:new_commit_branch)
+        let l:merge_line[l:commit_col] = "'"
+      else
+        let l:merge_line[l:commit_col] = '+'
+      endif
+
+      " build commit to resolve
+      if l:resolve_branch_index >= 0
+        let l:merge_line[l:resolve_branch_index * 2] = "'"
+      endif
+
+      " build_merge output for new branches
+      if len(l:new_branches)
+        let l:merge_line += repeat(['.', '-'], len(l:new_branches) - 1)
+        let l:merge_line += ['.', ' ']
+      endif
+
+      " add merge output
+      call add(l:display, join(l:merge_line, ''))
+    endif
+
+    " update stored branch structure
+
+    if empty(l:new_commit_branch)
+      let l:graph_branches[l:commit_branch_index] = ''
+    else
+      let l:graph_branches[l:commit_branch_index] = l:new_commit_branch
+      let l:graph_branches += l:new_branches
+      if l:resolve_branch_index >= 0
+        let l:graph_branches[l:resolve_branch_index] = ''
+      endif
+    endif
+
+    while len(l:graph_branches) && l:graph_branches[-1] ==# ''
+      call remove(l:graph_branches, -1)
+    endwhile
+
+    " remove empty branches and update output
+    let l:empty_branch = index(l:graph_branches, '')
+    while l:empty_branch >= 0
+      let l:line = ''
+
+      let l:i = 0
+      while l:i < len(l:graph_branches)
+        let l:branch = l:graph_branches[l:i]
+        if l:i == l:empty_branch
+          " do nothing
+        elseif l:branch ==# ''
+          let l:line .= '  '
+        elseif l:i < l:empty_branch
+          let l:line .= '| '
+        else
+          let l:line .= ' /'
+        endif
+        let l:i += 1
+      endwhile
+
+      call add(l:display, l:line)
+      call remove(l:graph_branches, l:empty_branch)
+      let l:empty_branch = index(l:graph_branches, '')
+    endwhile
+
+    " draw
+
+    call flog#start_drawing(a:state)
+    call flog#draw_at_end_of_graph(a:state, l:display)
+    call flog#finish_drawing(a:state)
+  endif
+endfunction
+
+" function! flog#draw_commit(commit, commit_graph_data) abort
+" endfunction
+
+" }}}
+
 " Graph buffer population {{{
 
 function! flog#modify_graph_buffer_contents(content) abort
@@ -1098,6 +1844,7 @@ function! flog#get_graph_cursor() abort
   return v:null
 endfunction
 
+" TODO: restore async
 function! flog#restore_graph_cursor(cursor) abort
   if type(a:cursor) != v:t_dict
     return
@@ -1148,6 +1895,38 @@ function! flog#populate_graph_buffer() abort
   call flog#restore_graph_cursor(l:cursor)
 endfunction
 
+function! flog#add_current_commit_to_graph(state) abort
+  let l:commit = flog#parse_log_commit_async(a:state.current_raw_commit)
+  call flog#finalize_current_commit_state(a:state, l:commit)
+  let l:commit_graph_data = flog#add_commit_to_graph(a:state, l:commit)
+  call flog#draw_commit(a:state, l:commit)
+  let a:state.current_raw_commit = []
+endfunction
+
+function! flog#populate_graph_buffer_async() abort
+  let l:state = flog#get_state()
+
+  " let l:cursor = flog#get_graph_cursor()
+
+  let l:command = flog#build_log_command_async()
+  let l:state.previous_log_command = l:command
+
+  call flog#draw_clear()
+  call flog#reset_log_command_state(l:state)
+  call flog#log_job_start(l:command)
+
+  " let l:output = flog#systemlist(l:command)
+  " let l:commits = flog#parse_log_output(l:output)
+
+  " call flog#set_graph_buffer_commits(l:commits)
+  " call flog#set_graph_buffer_title()
+  " call flog#set_graph_buffer_color()
+
+  " let l:state.commits = l:commits
+
+  " call flog#restore_graph_cursor(l:cursor)
+endfunction
+
 function! flog#graph_buffer_settings() abort
   exec 'lcd ' . flog#get_fugitive_workdir()
   set filetype=floggraph
@@ -1158,6 +1937,13 @@ function! flog#initialize_graph_buffer(state) abort
   call flog#trigger_fugitive_git_detection()
   call flog#graph_buffer_settings()
   call flog#populate_graph_buffer()
+endfunction
+
+function! flog#initialize_graph_buffer_async(state) abort
+  call flog#set_buffer_state(a:state)
+  call flog#trigger_fugitive_git_detection()
+  call flog#graph_buffer_settings()
+  call flog#populate_graph_buffer_async()
 endfunction
 
 " }}}
@@ -1338,6 +2124,16 @@ function! flog#open_graph(state) abort
   call flog#initialize_graph_buffer(a:state)
 endfunction
 
+function! flog#open_graph_async(state) abort
+  let l:window_name = 'flog-' . a:state.instance . ' [uninitialized]'
+  silent exec a:state.open_cmd . ' ' . l:window_name
+
+  let a:state.graph_window_id = win_getid()
+  let a:state.graph_buffer_id = bufnr('')
+
+  call flog#initialize_graph_buffer_async(a:state)
+endfunction
+
 function! flog#open(args) abort
   if !flog#is_fugitive_buffer()
     throw g:flog_not_a_fugitive_buffer
@@ -1349,6 +2145,19 @@ function! flog#open(args) abort
   let l:initial_state = flog#get_initial_state(l:parsed_args, l:original_file)
 
   call flog#open_graph(l:initial_state)
+endfunction
+
+function! flog#open_async(args) abort
+  if !flog#is_fugitive_buffer()
+    throw g:flog_not_a_fugitive_buffer
+  endif
+
+  let l:original_file = expand('%:p')
+
+  let l:parsed_args = flog#parse_args(a:args)
+  let l:initial_state = flog#get_initial_state_async(l:parsed_args, l:original_file)
+
+  call flog#open_graph_async(l:initial_state)
 endfunction
 
 function! flog#quit() abort
